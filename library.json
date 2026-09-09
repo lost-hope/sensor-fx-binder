@@ -1,0 +1,7 @@
+{
+  "name": "sensor-fx-binder",
+  "build": {
+    "libArchive": false
+  },
+  "dependencies": {}
+}
