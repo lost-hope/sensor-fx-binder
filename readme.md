@@ -96,5 +96,6 @@ to bind from.
 | *(per target)* Sensor | None | Which attached sensor drives this target - populated from whatever the Sensor Hub currently has attached |
 | *(continuous targets)* In-Min / In-Max | 0 / 100 | Expected sensor value range - calibrate per binding, these are placeholders |
 | *(continuous targets)* Out-Min / Out-Max | 0 / 255 (31 for Custom3) | Output range written to the target; Out-Min > Out-Max inverts the mapping |
+| *(continuous targets)* Deadband | 1 (Speed/Intensity/Custom1-3/Brightness), 2 (color channels) | Minimum change (0-255) required before a new value is applied. 1 = apply on any actual change; higher values trade responsiveness for fewer, larger steps - useful for damping sensor noise/jitter, especially on color/brightness where a 1-count jitter would otherwise restart WLED's fade transition every tick. Raise this (not the In-Min/In-Max range) if bound colors/brightness look "steppy" |
 | *(threshold targets)* Threshold | 50 | Numeric sensors: on above this value |
 | *(threshold targets)* Hysteresis | 0 | Deadband around Threshold to avoid flicker right at the boundary |

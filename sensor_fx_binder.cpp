@@ -56,11 +56,12 @@ struct ContinuousBinding {
   String sensor;        // attached sensor name to read via getValueByName(); "" = unbound
   float inMin, inMax;    // sensor value range this binding expects
   uint8_t outMin, outMax; // output range written to the target (may be inverted, outMin > outMax is fine)
+  uint8_t deadband;      // minimum |mapped - baseline| (in output units) required to actually apply a new value
   int16_t lastApplied;   // -1 = never applied yet; used to only write/notify on an actual change
 
-  ContinuousBinding(const char* key, ContinuousTarget t, uint8_t defaultOutMax = 255)
+  ContinuousBinding(const char* key, ContinuousTarget t, uint8_t defaultOutMax = 255, uint8_t defaultDeadband = 1)
     : jsonKey(key), target(t), sensor(""), inMin(0.0f), inMax(100.0f),
-      outMin(0), outMax(defaultOutMax), lastApplied(-1) {}
+      outMin(0), outMax(defaultOutMax), deadband(defaultDeadband), lastApplied(-1) {}
 };
 
 // One row of the "threshold" UI/config table (3 rows, check1-3).
@@ -99,15 +100,15 @@ class SensorFxBinderUsermod : public Usermod {
       ContinuousBinding("custom2",    ContinuousTarget::Custom2),
       ContinuousBinding("custom3",    ContinuousTarget::Custom3, 31), // uint8_t custom3 : 5 - only 0-31 is representable
       ContinuousBinding("brightness", ContinuousTarget::Brightness),
-      ContinuousBinding("color1ChA",  ContinuousTarget::Color1ChA),
-      ContinuousBinding("color1ChB",  ContinuousTarget::Color1ChB),
-      ContinuousBinding("color1ChC",  ContinuousTarget::Color1ChC),
-      ContinuousBinding("color2ChA",  ContinuousTarget::Color2ChA),
-      ContinuousBinding("color2ChB",  ContinuousTarget::Color2ChB),
-      ContinuousBinding("color2ChC",  ContinuousTarget::Color2ChC),
-      ContinuousBinding("color3ChA",  ContinuousTarget::Color3ChA),
-      ContinuousBinding("color3ChB",  ContinuousTarget::Color3ChB),
-      ContinuousBinding("color3ChC",  ContinuousTarget::Color3ChC),
+      ContinuousBinding("color1ChA",  ContinuousTarget::Color1ChA, 255, 2), // 2: color channels default to a small noise deadband (see applyColorSlot())
+      ContinuousBinding("color1ChB",  ContinuousTarget::Color1ChB, 255, 2),
+      ContinuousBinding("color1ChC",  ContinuousTarget::Color1ChC, 255, 2),
+      ContinuousBinding("color2ChA",  ContinuousTarget::Color2ChA, 255, 2),
+      ContinuousBinding("color2ChB",  ContinuousTarget::Color2ChB, 255, 2),
+      ContinuousBinding("color2ChC",  ContinuousTarget::Color2ChC, 255, 2),
+      ContinuousBinding("color3ChA",  ContinuousTarget::Color3ChA, 255, 2),
+      ContinuousBinding("color3ChB",  ContinuousTarget::Color3ChB, 255, 2),
+      ContinuousBinding("color3ChC",  ContinuousTarget::Color3ChC, 255, 2),
     };
     ThresholdBinding thresholds[3] = {
       ThresholdBinding("check1", ThresholdTarget::Check1),
@@ -159,7 +160,7 @@ class SensorFxBinderUsermod : public Usermod {
         ContinuousBinding& c = cont(sf.target);
         if (!c.sensor.length() || !hub->getValueByName(c.sensor.c_str(), raw)) continue;
         uint8_t mapped = mapContinuous(raw, c.inMin, c.inMax, c.outMin, c.outMax);
-        if (c.lastApplied >= 0 && (uint8_t)c.lastApplied == mapped) continue;
+        if (c.lastApplied >= 0 && abs((int)mapped - (int)c.lastApplied) < (int)c.deadband) continue;
         seg.*(sf.field) = mapped;
         c.lastApplied = mapped;
         changed = true;
@@ -169,7 +170,7 @@ class SensorFxBinderUsermod : public Usermod {
       if (c3.sensor.length() && hub->getValueByName(c3.sensor.c_str(), raw)) {
         uint8_t mapped = mapContinuous(raw, c3.inMin, c3.inMax, c3.outMin, c3.outMax);
         if (mapped > 31) mapped = 31; // bitfield safety net - see comment above
-        if (c3.lastApplied < 0 || (uint8_t)c3.lastApplied != mapped) {
+        if (c3.lastApplied < 0 || abs((int)mapped - (int)c3.lastApplied) >= (int)c3.deadband) {
           seg.custom3 = mapped;
           c3.lastApplied = mapped;
           changed = true;
@@ -219,15 +220,15 @@ class SensorFxBinderUsermod : public Usermod {
 
       if (chA.sensor.length() && hub->getValueByName(chA.sensor.c_str(), raw)) {
         uint8_t mapped = mapContinuous(raw, chA.inMin, chA.inMax, chA.outMin, chA.outMax);
-        if (abs((int)mapped - (int)a) >= 2) { a = mapped; changed = true; } // deadband: sensor noise shouldn't restart a fade every tick
+        if (abs((int)mapped - (int)a) >= (int)chA.deadband) { a = mapped; changed = true; } // deadband: sensor noise shouldn't restart a fade every tick
       }
       if (chB.sensor.length() && hub->getValueByName(chB.sensor.c_str(), raw)) {
         uint8_t mapped = mapContinuous(raw, chB.inMin, chB.inMax, chB.outMin, chB.outMax);
-        if (abs((int)mapped - (int)b) >= 2) { b = mapped; changed = true; }
+        if (abs((int)mapped - (int)b) >= (int)chB.deadband) { b = mapped; changed = true; }
       }
       if (chC.sensor.length() && hub->getValueByName(chC.sensor.c_str(), raw)) {
         uint8_t mapped = mapContinuous(raw, chC.inMin, chC.inMax, chC.outMin, chC.outMax);
-        if (abs((int)mapped - (int)c) >= 2) { c = mapped; changed = true; }
+        if (abs((int)mapped - (int)c) >= (int)chC.deadband) { c = mapped; changed = true; }
       }
 
       if (!changed) return false;
@@ -257,7 +258,7 @@ class SensorFxBinderUsermod : public Usermod {
       float raw;
       if (!hub->getValueByName(c.sensor.c_str(), raw)) return false;
       uint8_t mapped = mapContinuous(raw, c.inMin, c.inMax, c.outMin, c.outMax);
-      if (c.lastApplied >= 0 && (uint8_t)c.lastApplied == mapped) return false;
+      if (c.lastApplied >= 0 && abs((int)mapped - (int)c.lastApplied) < (int)c.deadband) return false;
       bri = mapped;
       c.lastApplied = mapped;
       return true;
@@ -363,6 +364,7 @@ class SensorFxBinderUsermod : public Usermod {
         o[F("inMax")] = c.inMax;
         o[F("outMin")] = c.outMin;
         o[F("outMax")] = c.outMax;
+        o[F("deadband")] = c.deadband;
       }
       for (auto& t : thresholds) {
         JsonObject o = top.createNestedObject(t.jsonKey);
@@ -389,6 +391,7 @@ class SensorFxBinderUsermod : public Usermod {
         getJsonValue(o[F("inMax")], c.inMax);
         getJsonValue(o[F("outMin")], c.outMin);
         getJsonValue(o[F("outMax")], c.outMax);
+        getJsonValue(o[F("deadband")], c.deadband);
       }
       for (auto& t : thresholds) {
         JsonObject o = top[t.jsonKey];
@@ -414,6 +417,7 @@ class SensorFxBinderUsermod : public Usermod {
         o[F("inMax")] = c.inMax;
         o[F("outMin")] = c.outMin;
         o[F("outMax")] = c.outMax;
+        o[F("deadband")] = c.deadband;
       }
       for (auto& t : thresholds) {
         JsonObject o = top.createNestedObject(t.jsonKey);
@@ -439,6 +443,7 @@ class SensorFxBinderUsermod : public Usermod {
         configComplete &= getJsonValue(o[F("inMax")], c.inMax);
         configComplete &= getJsonValue(o[F("outMin")], c.outMin);
         configComplete &= getJsonValue(o[F("outMax")], c.outMax);
+        configComplete &= getJsonValue(o[F("deadband")], c.deadband);
       }
       for (auto& t : thresholds) {
         JsonObject o = top[t.jsonKey];
@@ -467,6 +472,7 @@ class SensorFxBinderUsermod : public Usermod {
         settingsScript.printf_P(PSTR("addInfo('SensorFxBinder:%s:inMax',1,'sensor value mapped from (high end)');"), c.jsonKey);
         settingsScript.printf_P(PSTR("addInfo('SensorFxBinder:%s:outMin',1,'output value at inMin (outMin > outMax inverts the mapping)');"), c.jsonKey);
         settingsScript.printf_P(PSTR("addInfo('SensorFxBinder:%s:outMax',1,'output value at inMax');"), c.jsonKey);
+        settingsScript.printf_P(PSTR("addInfo('SensorFxBinder:%s:deadband',1,'minimum change (0-255) required before a new value is applied - higher reduces flicker/steps from sensor noise at the cost of responsiveness; 1 = apply on any change');"), c.jsonKey);
       }
       for (auto& t : thresholds) {
         addSensorDropdown(settingsScript, t.jsonKey);
