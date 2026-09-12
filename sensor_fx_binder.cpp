@@ -18,7 +18,11 @@
  * completely untouched, so the normal Effects-tab slider/color picker
  * still works for anything not bound here):
  *   - Continuous, linearly mapped (sensor inMin..inMax -> output outMin..outMax):
- *     Speed, Intensity, Custom1, Custom2, Custom3, Brightness, Red, Green, Blue.
+ *     Speed, Intensity, Custom1, Custom2, Custom3, Brightness, and three
+ *     channels (A/B/C) each for Color 1/2/3 (WLED's primary/secondary/
+ *     tertiary segment color). Each color slot has its own RGB/HSV mode
+ *     switch - in RGB mode channels A/B/C are Red/Green/Blue, in HSV mode
+ *     they're Hue/Saturation/Value, converted to RGB before writing.
  *   - Threshold (sensor crosses a value, with hysteresis -> on/off):
  *     Check1, Check2, Check3. A sensor that's already binary (Motion/
  *     Contact) is used directly instead, ignoring the threshold/hysteresis.
@@ -32,14 +36,20 @@
  * don't have this limitation - those are read live by essentially every effect.
  */
 
-enum class ContinuousTarget : uint8_t { Speed, Intensity, Custom1, Custom2, Custom3, Brightness, Red, Green, Blue };
+enum class ContinuousTarget : uint8_t {
+  Speed, Intensity, Custom1, Custom2, Custom3, Brightness,
+  Color1ChA, Color1ChB, Color1ChC,
+  Color2ChA, Color2ChB, Color2ChC,
+  Color3ChA, Color3ChB, Color3ChC
+};
 enum class ThresholdTarget  : uint8_t { Check1, Check2, Check3 };
 
-// One row of the "continuous, linearly mapped" UI/config table (9 rows).
-// Config/UI code treats all 9 uniformly (looped); the *apply* step does not
-// (see SensorFxBinderUsermod::apply* methods) - Custom3/Red/Green/Blue each
-// need field-specific handling that can't be generalized (bitfield / shared
-// color composition), so this struct is purely data, not "the whole story".
+// One row of the "continuous, linearly mapped" UI/config table (15 rows).
+// Config/UI code treats all 15 uniformly (looped); the *apply* step does not
+// (see SensorFxBinderUsermod::apply* methods) - Custom3/the color channels
+// each need field-specific handling that can't be generalized (bitfield /
+// shared color composition), so this struct is purely data, not "the whole
+// story".
 struct ContinuousBinding {
   const char* jsonKey; // also used verbatim as the addToConfig()/JSON key
   ContinuousTarget target;
@@ -78,17 +88,26 @@ class SensorFxBinderUsermod : public Usermod {
     // config
     uint8_t segmentId = 0;         // which segment the segment-scoped targets below apply to; brightness is global/exempt
     uint16_t updateIntervalMs = 100;
+    uint8_t color1Mode = 0;        // 0=RGB, 1=HSV - interpretation of Color1ChA/B/C below
+    uint8_t color2Mode = 0;
+    uint8_t color3Mode = 0;
 
-    ContinuousBinding continuous[9] = {
+    ContinuousBinding continuous[15] = {
       ContinuousBinding("speed",      ContinuousTarget::Speed),
       ContinuousBinding("intensity",  ContinuousTarget::Intensity),
       ContinuousBinding("custom1",    ContinuousTarget::Custom1),
       ContinuousBinding("custom2",    ContinuousTarget::Custom2),
       ContinuousBinding("custom3",    ContinuousTarget::Custom3, 31), // uint8_t custom3 : 5 - only 0-31 is representable
       ContinuousBinding("brightness", ContinuousTarget::Brightness),
-      ContinuousBinding("red",        ContinuousTarget::Red),
-      ContinuousBinding("green",      ContinuousTarget::Green),
-      ContinuousBinding("blue",       ContinuousTarget::Blue),
+      ContinuousBinding("color1ChA",  ContinuousTarget::Color1ChA),
+      ContinuousBinding("color1ChB",  ContinuousTarget::Color1ChB),
+      ContinuousBinding("color1ChC",  ContinuousTarget::Color1ChC),
+      ContinuousBinding("color2ChA",  ContinuousTarget::Color2ChA),
+      ContinuousBinding("color2ChB",  ContinuousTarget::Color2ChB),
+      ContinuousBinding("color2ChC",  ContinuousTarget::Color2ChC),
+      ContinuousBinding("color3ChA",  ContinuousTarget::Color3ChA),
+      ContinuousBinding("color3ChB",  ContinuousTarget::Color3ChB),
+      ContinuousBinding("color3ChC",  ContinuousTarget::Color3ChC),
     };
     ThresholdBinding thresholds[3] = {
       ThresholdBinding("check1", ThresholdTarget::Check1),
@@ -100,6 +119,9 @@ class SensorFxBinderUsermod : public Usermod {
     static const char _enabled[];
     static const char _segmentId[];
     static const char _updateInterval[];
+    static const char _color1Mode[];
+    static const char _color2Mode[];
+    static const char _color3Mode[];
 
     ContinuousBinding& cont(ContinuousTarget t) {
       for (auto& c : continuous) if (c.target == t) return c;
@@ -156,40 +178,77 @@ class SensorFxBinderUsermod : public Usermod {
       return changed;
     }
 
-    // Composes all three channels into one seg.setColor() call rather than
-    // three independent read-modify-writes, and deadbands against the
-    // segment's *current live* color (not our own last-written cache, the
-    // way the scalar fields above do) - a manual color change made via the
-    // UI in between our ticks should be respected until a bound channel's
-    // mapped value has actually moved away from it, not silently reverted
-    // to a stale cached value.
-    bool applyColor(Segment& seg) {
-      ContinuousBinding& rB = cont(ContinuousTarget::Red);
-      ContinuousBinding& gB = cont(ContinuousTarget::Green);
-      ContinuousBinding& bB = cont(ContinuousTarget::Blue);
-      if (!rB.sensor.length() && !gB.sensor.length() && !bB.sensor.length()) return false;
+    // Composes all three channels of one color slot into one seg.setColor()
+    // call rather than three independent read-modify-writes, and deadbands
+    // against the segment's *current live* color (not our own last-written
+    // cache, the way the scalar fields above do) - a manual color change
+    // made via the UI in between our ticks should be respected until a
+    // bound channel's mapped value has actually moved away from it, not
+    // silently reverted to a stale cached value.
+    //
+    // 'mode' selects how channels A/B/C are interpreted: 0=RGB (A=Red,
+    // B=Green, C=Blue) or 1=HSV (A=Hue, B=Saturation, C=Value), converted
+    // to RGB via WLED's own CHSV32/CRGBW (wled00/colors.h) before writing -
+    // same conversion WLED's own color picker and effects use. In HSV mode
+    // the *baseline* for an unbound channel is derived by converting the
+    // segment's current color to HSV first (not by reading its raw R/G/B
+    // bytes as if they were H/S/V), so a slot that's currently some RGB
+    // color and has e.g. only Hue bound still gets a sensible starting
+    // Saturation/Value instead of nonsense inherited from the wrong color space.
+    bool applyColorSlot(Segment& seg, uint8_t slot, uint8_t mode,
+                         ContinuousTarget chATarget, ContinuousTarget chBTarget, ContinuousTarget chCTarget) {
+      ContinuousBinding& chA = cont(chATarget);
+      ContinuousBinding& chB = cont(chBTarget);
+      ContinuousBinding& chC = cont(chCTarget);
+      if (!chA.sensor.length() && !chB.sensor.length() && !chC.sensor.length()) return false;
 
-      uint32_t cur = seg.colors[0];
-      uint8_t r = R(cur), g = G(cur), b = B(cur), w = W(cur);
+      uint32_t cur = seg.colors[slot];
+      uint8_t w = W(cur);
+      uint8_t a, b, c;
+      if (mode == 1) {
+        CHSV32 curHsv{ CRGBW(cur) };
+        a = (uint8_t)(curHsv.h >> 8); // CHSV32 stores an internal 16-bit hue; fold back to our 0-255 convention
+        b = curHsv.s;
+        c = curHsv.v;
+      } else {
+        a = R(cur); b = G(cur); c = B(cur);
+      }
+
       bool changed = false;
       float raw;
 
-      if (rB.sensor.length() && hub->getValueByName(rB.sensor.c_str(), raw)) {
-        uint8_t mapped = mapContinuous(raw, rB.inMin, rB.inMax, rB.outMin, rB.outMax);
-        if (abs((int)mapped - (int)r) >= 2) { r = mapped; changed = true; } // deadband: sensor noise shouldn't restart a fade every tick
+      if (chA.sensor.length() && hub->getValueByName(chA.sensor.c_str(), raw)) {
+        uint8_t mapped = mapContinuous(raw, chA.inMin, chA.inMax, chA.outMin, chA.outMax);
+        if (abs((int)mapped - (int)a) >= 2) { a = mapped; changed = true; } // deadband: sensor noise shouldn't restart a fade every tick
       }
-      if (gB.sensor.length() && hub->getValueByName(gB.sensor.c_str(), raw)) {
-        uint8_t mapped = mapContinuous(raw, gB.inMin, gB.inMax, gB.outMin, gB.outMax);
-        if (abs((int)mapped - (int)g) >= 2) { g = mapped; changed = true; }
-      }
-      if (bB.sensor.length() && hub->getValueByName(bB.sensor.c_str(), raw)) {
-        uint8_t mapped = mapContinuous(raw, bB.inMin, bB.inMax, bB.outMin, bB.outMax);
+      if (chB.sensor.length() && hub->getValueByName(chB.sensor.c_str(), raw)) {
+        uint8_t mapped = mapContinuous(raw, chB.inMin, chB.inMax, chB.outMin, chB.outMax);
         if (abs((int)mapped - (int)b) >= 2) { b = mapped; changed = true; }
+      }
+      if (chC.sensor.length() && hub->getValueByName(chC.sensor.c_str(), raw)) {
+        uint8_t mapped = mapContinuous(raw, chC.inMin, chC.inMax, chC.outMin, chC.outMax);
+        if (abs((int)mapped - (int)c) >= 2) { c = mapped; changed = true; }
       }
 
       if (!changed) return false;
-      seg.setColor(0, RGBW32(r, g, b, w));
+
+      uint32_t newColor;
+      if (mode == 1) {
+        newColor = CRGBW(CHSV32(a, b, c)).color32;
+        newColor = (newColor & 0x00FFFFFFUL) | ((uint32_t)w << 24); // hsv->rgb conversion doesn't produce a W byte - keep the original
+      } else {
+        newColor = RGBW32(a, b, c, w);
+      }
+      seg.setColor(slot, newColor);
       return true;
+    }
+
+    bool applyColors(Segment& seg) {
+      bool changed = false;
+      changed |= applyColorSlot(seg, 0, color1Mode, ContinuousTarget::Color1ChA, ContinuousTarget::Color1ChB, ContinuousTarget::Color1ChC);
+      changed |= applyColorSlot(seg, 1, color2Mode, ContinuousTarget::Color2ChA, ContinuousTarget::Color2ChB, ContinuousTarget::Color2ChC);
+      changed |= applyColorSlot(seg, 2, color3Mode, ContinuousTarget::Color3ChA, ContinuousTarget::Color3ChB, ContinuousTarget::Color3ChC);
+      return changed;
     }
 
     bool applyBrightness() {
@@ -269,7 +328,7 @@ class SensorFxBinderUsermod : public Usermod {
         Segment& seg = strip.getSegment(segmentId);
         if (seg.isActive()) {
           changed |= applySegmentScalars(seg);
-          changed |= applyColor(seg);
+          changed |= applyColors(seg);
           changed |= applyThresholds(seg);
         }
       }
@@ -294,6 +353,9 @@ class SensorFxBinderUsermod : public Usermod {
       top[FPSTR(_enabled)] = enabled;
       top[FPSTR(_segmentId)] = segmentId;
       top[FPSTR(_updateInterval)] = updateIntervalMs;
+      top[FPSTR(_color1Mode)] = color1Mode;
+      top[FPSTR(_color2Mode)] = color2Mode;
+      top[FPSTR(_color3Mode)] = color3Mode;
       for (auto& c : continuous) {
         JsonObject o = top.createNestedObject(c.jsonKey);
         o[F("sensor")] = c.sensor;
@@ -316,6 +378,9 @@ class SensorFxBinderUsermod : public Usermod {
       getJsonValue(top[FPSTR(_enabled)], enabled);
       getJsonValue(top[FPSTR(_segmentId)], segmentId);
       getJsonValue(top[FPSTR(_updateInterval)], updateIntervalMs);
+      getJsonValue(top[FPSTR(_color1Mode)], color1Mode);
+      getJsonValue(top[FPSTR(_color2Mode)], color2Mode);
+      getJsonValue(top[FPSTR(_color3Mode)], color3Mode);
       for (auto& c : continuous) {
         JsonObject o = top[c.jsonKey];
         if (o.isNull()) continue; // this particular target wasn't included - leave it bound as it was
@@ -339,6 +404,9 @@ class SensorFxBinderUsermod : public Usermod {
       top[FPSTR(_enabled)] = enabled;
       top[FPSTR(_segmentId)] = segmentId;
       top[FPSTR(_updateInterval)] = updateIntervalMs;
+      top[FPSTR(_color1Mode)] = color1Mode;
+      top[FPSTR(_color2Mode)] = color2Mode;
+      top[FPSTR(_color3Mode)] = color3Mode;
       for (auto& c : continuous) {
         JsonObject o = top.createNestedObject(c.jsonKey);
         o[F("sensor")] = c.sensor;
@@ -361,6 +429,9 @@ class SensorFxBinderUsermod : public Usermod {
       configComplete &= getJsonValue(top[FPSTR(_enabled)], enabled);
       configComplete &= getJsonValue(top[FPSTR(_segmentId)], segmentId);
       configComplete &= getJsonValue(top[FPSTR(_updateInterval)], updateIntervalMs);
+      configComplete &= getJsonValue(top[FPSTR(_color1Mode)], color1Mode);
+      configComplete &= getJsonValue(top[FPSTR(_color2Mode)], color2Mode);
+      configComplete &= getJsonValue(top[FPSTR(_color3Mode)], color3Mode);
       for (auto& c : continuous) {
         JsonObject o = top[c.jsonKey];
         configComplete &= getJsonValue(o[F("sensor")], c.sensor);
@@ -381,6 +452,13 @@ class SensorFxBinderUsermod : public Usermod {
     void appendConfigData(Print& settingsScript) override {
       settingsScript.print(F("addInfo('SensorFxBinder:segmentId',1,'which segment the effect-parameter/color targets below apply to - brightness is global, not segment-scoped');"));
       settingsScript.print(F("addInfo('SensorFxBinder:updateInterval',1,'milliseconds between binding updates');"));
+
+      settingsScript.print(F("dd=addDropdown('SensorFxBinder','color1Mode');addOption(dd,'RGB',0);addOption(dd,'HSV',1);"));
+      settingsScript.print(F("addInfo('SensorFxBinder:color1Mode',1,'Color 1 (primary) - interprets color1ChA/B/C below as Red/Green/Blue (RGB) or Hue/Saturation/Value (HSV)');"));
+      settingsScript.print(F("dd=addDropdown('SensorFxBinder','color2Mode');addOption(dd,'RGB',0);addOption(dd,'HSV',1);"));
+      settingsScript.print(F("addInfo('SensorFxBinder:color2Mode',1,'Color 2 (secondary) - interprets color2ChA/B/C below as Red/Green/Blue (RGB) or Hue/Saturation/Value (HSV)');"));
+      settingsScript.print(F("dd=addDropdown('SensorFxBinder','color3Mode');addOption(dd,'RGB',0);addOption(dd,'HSV',1);"));
+      settingsScript.print(F("addInfo('SensorFxBinder:color3Mode',1,'Color 3 (tertiary) - interprets color3ChA/B/C below as Red/Green/Blue (RGB) or Hue/Saturation/Value (HSV)');"));
 
       if (!hub) hub = getSensorHub();
       for (auto& c : continuous) {
@@ -404,6 +482,9 @@ const char SensorFxBinderUsermod::_name[]           PROGMEM = "SensorFxBinder";
 const char SensorFxBinderUsermod::_enabled[]        PROGMEM = "enabled";
 const char SensorFxBinderUsermod::_segmentId[]      PROGMEM = "segmentId";
 const char SensorFxBinderUsermod::_updateInterval[] PROGMEM = "updateInterval";
+const char SensorFxBinderUsermod::_color1Mode[]     PROGMEM = "color1Mode";
+const char SensorFxBinderUsermod::_color2Mode[]     PROGMEM = "color2Mode";
+const char SensorFxBinderUsermod::_color3Mode[]     PROGMEM = "color3Mode";
 
 static SensorFxBinderUsermod sensor_fx_binder;
 REGISTER_USERMOD(sensor_fx_binder);

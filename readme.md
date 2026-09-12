@@ -30,7 +30,24 @@ Effects-tab slider/color picker still works for anything not bound here.
 | Custom2 | `custom2` | |
 | Custom3 | `custom3` | Only 0-31 representable (5-bit field) - Out-Max above 31 is clamped |
 | Brightness | global `bri` | Not segment-scoped |
-| Red / Green / Blue | segment's primary color | Composed into one color write per tick |
+| Color 1 channels A/B/C | segment's primary color (`colors[0]`) | RGB or HSV, see below |
+| Color 2 channels A/B/C | segment's secondary color (`colors[1]`) | RGB or HSV, see below |
+| Color 3 channels A/B/C | segment's tertiary color (`colors[2]`) | RGB or HSV, see below |
+
+Each color slot has its own **Mode** setting, **RGB** or **HSV**, that decides
+what channels A/B/C mean for that slot:
+
+| Mode | Channel A | Channel B | Channel C |
+|---|---|---|---|
+| RGB (default) | Red | Green | Blue |
+| HSV | Hue | Saturation | Value |
+
+In HSV mode, the three channels are converted to RGB (via WLED's own
+`CHSV32`/`CRGBW`, the same conversion WLED's own color picker uses) before
+being written - so e.g. binding only Channel A (Hue) while leaving B/C
+unbound still works: the starting Saturation/Value are read back from the
+segment's current color, not left at zero. Each color slot is composed and
+written in a single `setColor()` call per tick, not one call per channel.
 
 **Threshold** (sensor crosses a value, with hysteresis, to on/off):
 
@@ -75,6 +92,7 @@ to bind from.
 | Enabled | on | Master on/off switch |
 | Segment ID | 0 | Which segment the segment-scoped targets apply to (brightness is global) |
 | Update interval | 100 ms | How often bindings are re-evaluated and (if changed) applied |
+| Color 1/2/3 Mode | RGB | RGB or HSV - see the color table above |
 | *(per target)* Sensor | None | Which attached sensor drives this target - populated from whatever the Sensor Hub currently has attached |
 | *(continuous targets)* In-Min / In-Max | 0 / 100 | Expected sensor value range - calibrate per binding, these are placeholders |
 | *(continuous targets)* Out-Min / Out-Max | 0 / 255 (31 for Custom3) | Output range written to the target; Out-Min > Out-Max inverts the mapping |
